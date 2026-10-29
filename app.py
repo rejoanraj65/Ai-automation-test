@@ -1,0 +1,787 @@
+"""
+Single-file AI Price List Automation MVP
+========================================
+Run locally:
+    pip install fastapi uvicorn requests openpyxl apscheduler python-multipart python-docx
+    uvicorn app:app --host 0.0.0.0 --port 8000
+
+Render:
+    Build command: pip install -r requirements.txt
+    Start command: uvicorn app:app --host 0.0.0.0 --port $PORT
+
+IMPORTANT:
+- This prototype intentionally has NO login, as requested. Anyone who can open the
+  website can create/edit/delete client profiles and change the Gemini API key.
+  Do not put real secrets or sensitive client data here until access control is added.
+- Render Free has an ephemeral filesystem and sleeps. SQLite data and generated files
+  may disappear on restart/redeploy; hourly jobs do not run while the service sleeps.
+- Public data endpoints are intentionally readable by anyone.
+"""
+
+import os
+import re
+import io
+import json
+import time
+import uuid
+import sqlite3
+import logging
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import requests
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
+APP_TITLE = "PriceList AI"
+DB_PATH = os.getenv("DATABASE_PATH", "pricelist.db")
+POLL_MINUTES = max(5, int(os.getenv("POLL_MINUTES", "60")))
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+HTTP_TIMEOUT = 35
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("pricelist-ai")
+
+app = FastAPI(title=APP_TITLE, version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source_url TEXT DEFAULT '',
+                source_type TEXT DEFAULT 'text',
+                source_text TEXT DEFAULT '',
+                products_json TEXT DEFAULT '[]',
+                source_hash TEXT DEFAULT '',
+                last_checked TEXT DEFAULT '',
+                last_updated TEXT DEFAULT '',
+                status TEXT DEFAULT 'Waiting',
+                last_error TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                details TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        con.commit()
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def setting_get(key, default=""):
+    with db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def setting_set(key, value):
+    with db() as con:
+        con.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        con.commit()
+
+
+def log_event(client_id, event, details=""):
+    with db() as con:
+        con.execute(
+            "INSERT INTO history(client_id,event,details,created_at) VALUES(?,?,?,?)",
+            (client_id, event, str(details)[:2000], now_iso()),
+        )
+        con.commit()
+
+
+def slugify(value):
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value).strip("-")
+    return value[:45] or "client"
+
+
+def make_client_id(name):
+    base = slugify(name)
+    return f"{base}-{uuid.uuid4().hex[:6]}"
+
+
+def get_client(client_id):
+    with db() as con:
+        row = con.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Client not found")
+    return dict(row)
+
+
+def update_client(client_id, **fields):
+    allowed = {
+        "name", "source_url", "source_type", "source_text", "products_json",
+        "source_hash", "last_checked", "last_updated", "status", "last_error"
+    }
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return
+    sql = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [client_id]
+    with db() as con:
+        con.execute(f"UPDATE clients SET {sql} WHERE id=?", values)
+        con.commit()
+
+
+def sha256_text(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def extract_google_doc_id(url):
+    patterns = [
+        r"/document/d/([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    raise ValueError("Google Docs URL থেকে Document ID পাওয়া যায়নি।")
+
+
+def fetch_public_google_doc(url):
+    doc_id = extract_google_doc_id(url)
+    export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
+    response = requests.get(
+        export_url,
+        timeout=HTTP_TIMEOUT,
+        headers={"User-Agent": "Mozilla/5.0 PriceListAI/1.0"},
+    )
+    if response.status_code != 200:
+        raise ValueError(
+            "Google Doc পড়া যায়নি। Sharing সেটিংস 'Anyone with the link – Viewer' "
+            "করো এবং লিংকটি ঠিক আছে কি না দেখো।"
+        )
+    text = response.content.decode("utf-8", errors="replace").strip()
+    if not text or "accounts.google.com" in text[:1000]:
+        raise ValueError("ডকুমেন্টের টেক্সট পাওয়া যায়নি। ডকুমেন্টটি Public Viewer কি না যাচাই করো।")
+    return text
+
+
+def read_uploaded_file(filename, raw):
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext in ("txt", "csv", "md"):
+        return raw.decode("utf-8-sig", errors="replace")
+    if ext == "docx":
+        if Document is None:
+            raise ValueError("DOCX পড়তে python-docx ইনস্টল করতে হবে।")
+        document = Document(io.BytesIO(raw))
+        lines = [p.text for p in document.paragraphs if p.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                lines.append(" | ".join(cell.text.strip() for cell in row.cells))
+        return "\n".join(lines)
+    if ext == "xlsx":
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+        lines = []
+        for ws in wb.worksheets:
+            lines.append(f"Sheet: {ws.title}")
+            for row in ws.iter_rows(values_only=True):
+                vals = [str(v).strip() for v in row if v is not None and str(v).strip()]
+                if vals:
+                    lines.append(" | ".join(vals))
+        return "\n".join(lines)
+    if ext == "xls":
+        raise ValueError("পুরোনো .xls নয়; Excel ফাইলটি .xlsx হিসেবে Save করে আপলোড করো।")
+    raise ValueError("সমর্থিত ফাইল: TXT, CSV, MD, DOCX, XLSX")
+
+
+def discover_gemini_models(api_key):
+    response = requests.get(
+        f"{GEMINI_API_BASE}/models",
+        params={"key": api_key},
+        timeout=HTTP_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise ValueError(f"Gemini model list error: {response.status_code} {response.text[:400]}")
+    models = response.json().get("models", [])
+    usable = []
+    for model in models:
+        methods = model.get("supportedGenerationMethods", [])
+        name = model.get("name", "")
+        if "generateContent" in methods and name:
+            short_name = name.replace("models/", "")
+            usable.append({
+                "name": short_name,
+                "display_name": model.get("displayName", short_name),
+                "input_token_limit": model.get("inputTokenLimit"),
+                "output_token_limit": model.get("outputTokenLimit"),
+            })
+    return usable
+
+
+def order_models(models):
+    # Prefer Flash for routine extraction; keep the remaining compatible models
+    # as fallbacks if a model is overloaded, unavailable, or rejects the request.
+    def rank(model):
+        name = model["name"].lower()
+        if "flash" in name:
+            return (0, name)
+        if "pro" in name:
+            return (1, name)
+        return (2, name)
+    ordered = sorted(models, key=rank)
+    if not ordered:
+        raise ValueError("এই API Key-তে generateContent সমর্থিত কোনো Gemini model পাওয়া যায়নি।")
+    return ordered
+
+
+def call_gemini(api_key, model, source_text):
+    prompt = """
+You are a precise product price-list extraction engine.
+Extract every product from the source text. The source may contain Bangla or English,
+brand headings, messy line breaks, spelling errors, and inconsistent formatting.
+
+Return ONLY valid JSON, no markdown, using exactly this shape:
+{
+  "products": [
+    {
+      "brand": "Brand name or empty string",
+      "model": "Full product/model name",
+      "variant": "RAM/ROM or other variant, empty if absent",
+      "price": 0,
+      "currency": "BDT",
+      "notes": ""
+    }
+  ],
+  "warnings": ["uncertain or ambiguous items"]
+}
+
+Rules:
+- Never invent a price or product.
+- price must be a number when clearly present; otherwise null.
+- Keep distinct RAM/ROM variants as separate products.
+- Do not merge two similar but different models.
+- Ignore headings, phone numbers, dates, and unrelated text.
+- Preserve Bangla product/model text where appropriate.
+- If a line is ambiguous, include it only when reasonably identifiable and add a warning.
+- Do not treat an old price as current unless the source says so.
+SOURCE DOCUMENT:
+""" + source_text[:180000]
+
+    url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
+    response = requests.post(
+        url,
+        params={"key": api_key},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+            },
+        },
+        timeout=90,
+    )
+    if response.status_code != 200:
+        raise ValueError(f"Gemini API error ({response.status_code}): {response.text[:700]}")
+    payload = response.json()
+    try:
+        answer = payload["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("Gemini থেকে ব্যবহারযোগ্য response পাওয়া যায়নি।")
+    answer = answer.strip()
+    answer = re.sub(r"^```(?:json)?\s*", "", answer)
+    answer = re.sub(r"\s*```$", "", answer)
+    data = json.loads(answer)
+    products = normalize_products(data.get("products", []))
+    return products, data.get("warnings", [])
+
+
+def normalize_products(items):
+    cleaned = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        brand = str(item.get("brand") or "").strip()
+        model = str(item.get("model") or "").strip()
+        variant = str(item.get("variant") or "").strip()
+        notes = str(item.get("notes") or "").strip()
+        price = item.get("price")
+        if not model:
+            continue
+        try:
+            if price is not None and price != "":
+                price = float(str(price).replace(",", "").replace("৳", "").strip())
+                if price.is_integer():
+                    price = int(price)
+            else:
+                price = None
+        except Exception:
+            price = None
+        key = (brand.casefold(), model.casefold(), variant.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append({
+            "brand": brand,
+            "model": model,
+            "variant": variant,
+            "price": price,
+            "currency": str(item.get("currency") or "BDT"),
+            "notes": notes,
+        })
+    return cleaned
+
+
+def process_client(client_id, force=False):
+    client = get_client(client_id)
+    api_key = setting_get("gemini_api_key")
+    if not api_key:
+        update_client(client_id, status="Needs API Key", last_error="Gemini API Key সেট করা হয়নি।")
+        return {"ok": False, "error": "Gemini API Key সেট করা হয়নি।"}
+
+    try:
+        if client["source_type"] == "google_docs":
+            source_text = fetch_public_google_doc(client["source_url"])
+        else:
+            source_text = client["source_text"]
+
+        if not source_text.strip():
+            raise ValueError("Source document খালি।")
+
+        current_hash = sha256_text(source_text)
+        if not force and current_hash == client.get("source_hash") and client.get("products_json"):
+            update_client(client_id, last_checked=now_iso(), status="No Changes", last_error="")
+            log_event(client_id, "Hourly check", "কোনো পরিবর্তন পাওয়া যায়নি।")
+            return {"ok": True, "changed": False, "message": "কোনো পরিবর্তন নেই।"}
+
+        models = order_models(discover_gemini_models(api_key))
+        products, warnings = None, []
+        model, model_errors = "", []
+        for candidate in models:
+            try:
+                products, warnings = call_gemini(api_key, candidate["name"], source_text)
+                model = candidate["name"]
+                break
+            except Exception as model_exc:
+                model_errors.append(f"{candidate['name']}: {model_exc}")
+                log.warning("Gemini model fallback: %s", model_errors[-1])
+        if products is None:
+            raise ValueError("সব উপলব্ধ Gemini model ব্যর্থ হয়েছে: " + " | ".join(model_errors)[:1500])
+
+        if not products:
+            raise ValueError("AI কোনো পণ্য শনাক্ত করেনি; আগের ডেটা নিরাপদ রাখতে আপডেট বাতিল করা হয়েছে।")
+
+        old_products = json.loads(client.get("products_json") or "[]")
+        old_map = {
+            (p.get("brand", "").casefold(), p.get("model", "").casefold(), p.get("variant", "").casefold()): p
+            for p in old_products
+        }
+        new_map = {
+            (p.get("brand", "").casefold(), p.get("model", "").casefold(), p.get("variant", "").casefold()): p
+            for p in products
+        }
+        added = len(set(new_map) - set(old_map))
+        removed = len(set(old_map) - set(new_map))
+        changed = sum(1 for k in set(new_map) & set(old_map) if new_map[k] != old_map[k])
+
+        update_client(
+            client_id,
+            source_text=source_text,
+            products_json=json.dumps(products, ensure_ascii=False),
+            source_hash=current_hash,
+            last_checked=now_iso(),
+            last_updated=now_iso(),
+            status="Processed",
+            last_error="",
+        )
+        details = f"Model: {model}; Products: {len(products)}; Added: {added}; Changed: {changed}; Removed: {removed}; Warnings: {len(warnings)}"
+        log_event(client_id, "Processed", details)
+        if warnings:
+            log_event(client_id, "AI warnings", json.dumps(warnings, ensure_ascii=False)[:1800])
+        return {
+            "ok": True, "changed": True, "model": model, "total_products": len(products),
+            "added": added, "changed_products": changed, "removed": removed, "warnings": warnings,
+        }
+    except Exception as exc:
+        log.exception("Processing failed for %s", client_id)
+        update_client(client_id, status="Error", last_checked=now_iso(), last_error=str(exc))
+        log_event(client_id, "Error", str(exc))
+        return {"ok": False, "error": str(exc)}
+
+
+def hourly_sync():
+    try:
+        with db() as con:
+            rows = con.execute(
+                "SELECT id FROM clients WHERE source_type='google_docs' AND source_url<>''"
+            ).fetchall()
+        for row in rows:
+            process_client(row["id"], force=False)
+            time.sleep(1)
+    except Exception:
+        log.exception("Hourly sync failed")
+
+
+def build_excel(products, client_name):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Price List"
+    headers = ["Brand", "Model", "Variant", "Price", "Currency", "Notes"]
+    ws.append([client_name])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    ws["A1"].font = Font(bold=True, size=16, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", fgColor="17365D")
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ws.append(headers)
+    for cell in ws[2]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2874A6")
+        cell.alignment = Alignment(horizontal="center")
+    for p in products:
+        ws.append([
+            p.get("brand"), p.get("model"), p.get("variant"),
+            p.get("price"), p.get("currency"), p.get("notes")
+        ])
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = f"A2:F{max(2, ws.max_row)}"
+    widths = [20, 34, 20, 15, 12, 35]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+
+def public_base_url(request=None):
+    configured = setting_get("public_base_url").strip().rstrip("/")
+    if configured:
+        return configured
+    if request:
+        return str(request.base_url).rstrip("/")
+    return ""
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+    scheduler = BackgroundScheduler(daemon=True, timezone="UTC")
+    scheduler.add_job(hourly_sync, "interval", minutes=POLL_MINUTES, id="hourly_sync", replace_existing=True)
+    scheduler.start()
+    app.state.scheduler = scheduler
+    log.info("Started. Hourly sync interval: %s minutes", POLL_MINUTES)
+
+
+@app.on_event("shutdown")
+def shutdown():
+    scheduler = getattr(app.state, "scheduler", None)
+    if scheduler:
+        scheduler.shutdown(wait=False)
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTMLResponse(HTML_PAGE)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "app": APP_TITLE, "time": now_iso()}
+
+
+@app.get("/api/settings")
+def get_settings():
+    key = setting_get("gemini_api_key")
+    return {
+        "gemini_key_configured": bool(key),
+        "public_base_url": setting_get("public_base_url"),
+        "poll_minutes": POLL_MINUTES,
+    }
+
+
+@app.post("/api/settings")
+def save_settings(payload: dict):
+    if "gemini_api_key" in payload:
+        setting_set("gemini_api_key", str(payload["gemini_api_key"]).strip())
+    if "public_base_url" in payload:
+        setting_set("public_base_url", str(payload["public_base_url"]).strip().rstrip("/"))
+    return {"ok": True, "message": "Settings saved"}
+
+
+@app.post("/api/gemini/models")
+def gemini_models(payload: dict):
+    key = str(payload.get("api_key") or setting_get("gemini_api_key")).strip()
+    if not key:
+        raise HTTPException(400, "Gemini API Key দাও।")
+    try:
+        return {"models": discover_gemini_models(key)}
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/clients")
+def list_clients(request: Request):
+    with db() as con:
+        rows = con.execute("SELECT * FROM clients ORDER BY created_at DESC").fetchall()
+    base = public_base_url(request)
+    result = []
+    for row in rows:
+        c = dict(row)
+        products = json.loads(c.get("products_json") or "[]")
+        result.append({
+            "id": c["id"], "name": c["name"], "source_url": c["source_url"],
+            "source_type": c["source_type"], "total_products": len(products),
+            "status": c["status"], "last_checked": c["last_checked"],
+            "last_updated": c["last_updated"], "last_error": c["last_error"],
+            "public_url": f"{base}/data/{c['id']}" if base else f"/data/{c['id']}",
+            "api_url": f"{base}/api/public/{c['id']}" if base else f"/api/public/{c['id']}",
+        })
+    return result
+
+
+@app.post("/api/clients")
+def create_client(payload: dict):
+    name = str(payload.get("name") or "").strip()
+    source_url = str(payload.get("source_url") or "").strip()
+    if not name:
+        raise HTTPException(400, "Client name প্রয়োজন।")
+    if source_url and "docs.google.com/document" not in source_url:
+        raise HTTPException(400, "এখানে Google Docs document URL দিতে হবে।")
+    client_id = make_client_id(name)
+    source_type = "google_docs" if source_url else "text"
+    with db() as con:
+        con.execute(
+            "INSERT INTO clients(id,name,source_url,source_type,created_at) VALUES(?,?,?,?,?)",
+            (client_id, name, source_url, source_type, now_iso()),
+        )
+        con.commit()
+    log_event(client_id, "Created", "Client profile created")
+    return {"ok": True, "id": client_id, "name": name}
+
+
+@app.post("/api/clients/{client_id}/upload")
+async def upload_source(client_id: str, file: UploadFile = File(...)):
+    get_client(client_id)
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "ফাইল সর্বোচ্চ 15 MB হতে পারবে।")
+    try:
+        text = read_uploaded_file(file.filename or "upload.txt", raw)
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+    if not text.strip():
+        raise HTTPException(400, "ফাইলে কোনো টেক্সট পাওয়া যায়নি।")
+    update_client(client_id, source_type="upload", source_text=text, source_url="")
+    log_event(client_id, "Source uploaded", file.filename or "file")
+    return {"ok": True, "characters": len(text), "message": "Source uploaded. এখন Process চাপো।"}
+
+
+@app.post("/api/clients/{client_id}/process")
+def process_now(client_id: str):
+    return process_client(client_id, force=True)
+
+
+@app.post("/api/clients/{client_id}/check")
+def check_now(client_id: str):
+    return process_client(client_id, force=False)
+
+
+@app.get("/api/clients/{client_id}")
+def client_detail(client_id: str):
+    c = get_client(client_id)
+    products = json.loads(c.get("products_json") or "[]")
+    with db() as con:
+        history = con.execute(
+            "SELECT event,details,created_at FROM history WHERE client_id=? ORDER BY id DESC LIMIT 30",
+            (client_id,),
+        ).fetchall()
+    return {
+        "id": c["id"], "name": c["name"], "source_url": c["source_url"],
+        "source_type": c["source_type"], "products": products,
+        "status": c["status"], "last_checked": c["last_checked"],
+        "last_updated": c["last_updated"], "last_error": c["last_error"],
+        "history": [dict(x) for x in history],
+    }
+
+
+@app.delete("/api/clients/{client_id}")
+def delete_client(client_id: str):
+    get_client(client_id)
+    with db() as con:
+        con.execute("DELETE FROM clients WHERE id=?", (client_id,))
+        con.execute("DELETE FROM history WHERE client_id=?", (client_id,))
+        con.commit()
+    return {"ok": True}
+
+
+@app.get("/api/public/{client_id}")
+def public_json(client_id: str):
+    c = get_client(client_id)
+    products = json.loads(c.get("products_json") or "[]")
+    return JSONResponse({
+        "client_id": c["id"],
+        "client_name": c["name"],
+        "last_updated": c["last_updated"],
+        "total_products": len(products),
+        "products": products,
+    })
+
+
+@app.get("/data/{client_id}", response_class=HTMLResponse)
+def public_view(client_id: str):
+    c = get_client(client_id)
+    products = json.loads(c.get("products_json") or "[]")
+    safe_name = (c["name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    rows = []
+    for p in products:
+        vals = [p.get("brand"), p.get("model"), p.get("variant"), p.get("price"), p.get("currency"), p.get("notes")]
+        cells = "".join("<td>" + str(v if v is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</td>" for v in vals)
+        rows.append("<tr>" + cells + "</tr>")
+    table = "".join(rows) or '<tr><td colspan="6">No processed products yet.</td></tr>'
+    html = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>{safe_name} - Price List</title><style>
+    body{{font-family:Arial,sans-serif;background:#f4f6fa;margin:0;color:#172033}}
+    header{{background:#13213b;color:white;padding:24px}}main{{max-width:1100px;margin:24px auto;padding:0 16px}}
+    .meta{{color:#667085;font-size:13px;margin:12px 0}}.wrap{{overflow:auto;background:white;border-radius:14px;box-shadow:0 4px 22px #17203312}}
+    table{{border-collapse:collapse;width:100%;min-width:700px}}th,td{{padding:12px 14px;border-bottom:1px solid #edf0f4;text-align:left}}
+    th{{background:#eaf0f8;position:sticky;top:0}}tr:hover td{{background:#f8fbff}}
+    a{{color:#1d63c4;text-decoration:none}}.top{{display:flex;gap:16px;flex-wrap:wrap;justify-content:space-between;align-items:center}}
+    input{{padding:10px 12px;border:1px solid #d5dbe5;border-radius:8px;width:min(300px,80vw)}}
+    </style></head><body><header><div class="top"><div><h1>{safe_name}</h1><div>Public Product Price List</div></div>
+    <div><a style="color:white" href="/api/public/{client_id}">JSON API</a> · <a style="color:white" href="/download/{client_id}.xlsx">Download Excel</a></div></div></header>
+    <main><input id="q" placeholder="Search brand, model, variant..." oninput="filterRows()">
+    <div class="meta">Products: {len(products)} · Last updated: {c.get('last_updated') or 'Not processed yet'}</div>
+    <div class="wrap"><table id="tbl"><thead><tr><th>Brand</th><th>Model</th><th>Variant</th><th>Price</th><th>Currency</th><th>Notes</th></tr></thead><tbody>{table}</tbody></table></div>
+    </main><script>function filterRows(){{let q=document.getElementById('q').value.toLowerCase();document.querySelectorAll('#tbl tbody tr').forEach(r=>r.style.display=r.innerText.toLowerCase().includes(q)?'':'none')}}</script></body></html>"""
+    return HTMLResponse(html)
+
+
+@app.get("/download/{client_id}.xlsx")
+def download_excel(client_id: str):
+    c = get_client(client_id)
+    products = json.loads(c.get("products_json") or "[]")
+    stream = build_excel(products, c["name"])
+    filename = re.sub(r"[^A-Za-z0-9_-]+", "_", c["name"])[:50] or "price-list"
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}.xlsx"'},
+    )
+
+
+@app.get("/api/clients/{client_id}/changes")
+def client_changes(client_id: str):
+    get_client(client_id)
+    with db() as con:
+        rows = con.execute(
+            "SELECT event,details,created_at FROM history WHERE client_id=? ORDER BY id DESC LIMIT 20",
+            (client_id,),
+        ).fetchall()
+    return {"client_id": client_id, "events": [dict(r) for r in rows]}
+
+
+HTML_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PriceList AI</title><style>
+:root{--bg:#f3f6fb;--card:#fff;--ink:#172033;--muted:#667085;--line:#e5eaf2;--blue:#315efb;--navy:#13213b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px Inter,Arial,sans-serif}
+header{background:linear-gradient(120deg,#13213b,#244b87);color:white;padding:25px 22px}
+header h1{margin:0 0 6px;font-size:25px}header p{margin:0;color:#d5e1f5}
+main{max-width:1180px;margin:24px auto;padding:0 16px}.grid{display:grid;grid-template-columns:360px 1fr;gap:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:0 6px 24px #17203308}
+h2{font-size:17px;margin:0 0 15px}.field{margin:12px 0}.field label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+input,textarea{width:100%;border:1px solid #d6deea;border-radius:9px;padding:11px 12px;font:inherit;background:#fff}
+button{border:0;border-radius:9px;background:var(--blue);color:white;padding:11px 15px;font-weight:600;cursor:pointer}
+button.secondary{background:#eaf0ff;color:#2347c8}button.danger{background:#fff0f0;color:#b42318}
+button:disabled{opacity:.5;cursor:wait}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.small{font-size:12px;color:var(--muted)}.notice{padding:11px 12px;border-radius:10px;background:#fff7e6;color:#875a00;font-size:12px;line-height:1.5;margin-bottom:15px}
+.status{font-size:12px;border-radius:20px;padding:5px 9px;background:#edf2f7;color:#475467}
+.list{display:grid;gap:10px}.client{border:1px solid var(--line);border-radius:12px;padding:13px}
+.client strong{display:block;margin-bottom:5px}.client a{font-size:12px;color:#315efb;word-break:break-all}
+.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.actions button{font-size:12px;padding:8px 10px}
+#message{margin:12px 0;color:#2347c8;font-size:13px;white-space:pre-wrap}
+footer{max-width:1180px;margin:10px auto 30px;padding:0 16px;color:var(--muted);font-size:12px}
+@media(max-width:850px){.grid{grid-template-columns:1fr}}
+</style></head><body>
+<header><h1>PriceList AI</h1><p>Public document → AI extraction → Excel + permanent public data URL</p></header>
+<main>
+<div class="notice"><b>Prototype notice:</b> এই ড্যাশবোর্ডে login নেই। ওয়েবসাইটের URL জানা যে কেউ client তৈরি, মুছে ফেলা এবং API settings পরিবর্তন করতে পারবে। Render Free-তে data restart/redeploy হলে হারাতে পারে।</div>
+<div class="grid">
+<section class="card">
+<h2>Gemini API Settings</h2>
+<div class="field"><label>Gemini API Key</label><input id="apiKey" type="password" placeholder="Paste Gemini API key"></div>
+<div class="field"><label>Public website base URL (optional)</label><input id="baseUrl" placeholder="https://your-app.onrender.com"></div>
+<div class="row"><button onclick="saveSettings()">Save Settings</button><button class="secondary" onclick="loadModels()">Discover Models</button></div>
+<div id="models" class="small" style="margin-top:10px"></div>
+<hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
+<h2>Create Client Profile</h2>
+<div class="field"><label>Client / Shop Name</label><input id="clientName" placeholder="Example: ABC Mobile Shop"></div>
+<div class="field"><label>Public Google Docs URL (optional)</label><input id="docUrl" placeholder="https://docs.google.com/document/d/..."></div>
+<button onclick="createClient()">Create Profile</button>
+<p class="small">Google Docs sharing: Anyone with the link → Viewer.</p>
+<hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
+<h2>Upload a source file</h2>
+<div class="field"><label>Choose an existing client</label><select id="uploadClient" style="width:100%;padding:11px;border:1px solid #d6deea;border-radius:9px"><option value="">Select client</option></select></div>
+<div class="field"><label>TXT, CSV, DOCX or XLSX (max 15 MB)</label><input id="sourceFile" type="file" accept=".txt,.csv,.md,.docx,.xlsx"></div>
+<button onclick="uploadFile()">Upload File</button>
+<div id="message"></div>
+</section>
+<section class="card">
+<div class="row" style="justify-content:space-between"><h2>Client Profiles</h2><button class="secondary" onclick="loadClients()">Refresh</button></div>
+<div id="clients" class="list"><p class="small">Loading...</p></div>
+</section>
+</div></main>
+<footer>PriceList AI MVP · Public data endpoints are designed for AI agents and other clients.</footer>
+<script>
+async function api(url,opts={}){let r=await fetch(url,opts);let d=await r.json().catch(()=>({detail:"Unexpected server response"}));if(!r.ok)throw new Error(d.detail||d.error||"Request failed");return d}
+function msg(t){document.getElementById('message').textContent=t}
+async function init(){try{let s=await api('/api/settings');document.getElementById('baseUrl').value=s.public_base_url||'';document.getElementById('apiKey').placeholder=s.gemini_key_configured?'API key already saved (enter new key to replace)':'Paste Gemini API key';await loadClients()}catch(e){msg(e.message)}}
+async function saveSettings(){try{let p={public_base_url:document.getElementById('baseUrl').value};let k=document.getElementById('apiKey').value;if(k)p.gemini_api_key=k;await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});document.getElementById('apiKey').value='';msg('Settings saved.')}catch(e){msg(e.message)}}
+async function loadModels(){try{let k=document.getElementById('apiKey').value;let d=await api('/api/gemini/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:k})});document.getElementById('models').textContent='Available generateContent models: '+d.models.map(x=>x.name).join(', ')}catch(e){document.getElementById('models').textContent=e.message}}
+async function createClient(){try{let name=document.getElementById('clientName').value.trim(),url=document.getElementById('docUrl').value.trim();let d=await api('/api/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,source_url:url})});document.getElementById('clientName').value='';document.getElementById('docUrl').value='';msg('Profile created: '+d.id);await loadClients()}catch(e){msg(e.message)}}
+async function uploadFile(){try{let id=document.getElementById('uploadClient').value,f=document.getElementById('sourceFile').files[0];if(!id||!f)throw new Error('Client এবং file select করো।');let fd=new FormData();fd.append('file',f);let d=await api('/api/clients/'+id+'/upload',{method:'POST',body:fd});msg(d.message);await loadClients()}catch(e){msg(e.message)}}
+async function runAction(id,action){try{msg('Processing...');let d=await api('/api/clients/'+id+'/'+action,{method:'POST'});msg(JSON.stringify(d,null,2));await loadClients()}catch(e){msg(e.message)}}
+async function removeClient(id){if(!confirm('এই client profile এবং তার history মুছে ফেলবে?'))return;try{await api('/api/clients/'+id,{method:'DELETE'});msg('Client deleted.');await loadClients()}catch(e){msg(e.message)}}
+async function loadClients(){try{let a=await api('/api/clients');let sel=document.getElementById('uploadClient');sel.innerHTML='<option value="">Select client</option>';a.forEach(c=>{let o=document.createElement('option');o.value=c.id;o.textContent=c.name;sel.appendChild(o)});let root=document.getElementById('clients');if(!a.length){root.innerHTML='<p class="small">No clients yet. Create the first profile.</p>';return}root.innerHTML=a.map(c=>`<div class="client"><div class="row" style="justify-content:space-between"><strong>${esc(c.name)}</strong><span class="status">${esc(c.status)}</span></div><div class="small">${c.total_products} products · Last check: ${esc(c.last_checked||'Never')}</div><div style="margin-top:8px"><a href="${c.public_url}" target="_blank">Public viewer: ${esc(c.public_url)}</a><br><a href="${c.api_url}" target="_blank">JSON API: ${esc(c.api_url)}</a></div>${c.last_error?`<p class="small" style="color:#b42318">${esc(c.last_error)}</p>`:''}<div class="actions"><button onclick="runAction('${c.id}','process')">Process Now</button><button class="secondary" onclick="runAction('${c.id}','check')">Check Changes</button><button class="secondary" onclick="window.open('/download/${c.id}.xlsx','_blank')">Excel</button><button class="danger" onclick="removeClient('${c.id}')">Delete</button></div></div>`).join('')}catch(e){msg(e.message)}}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+init();
+</script></body></html>"""
